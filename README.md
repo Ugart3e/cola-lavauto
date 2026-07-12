@@ -1,0 +1,1 @@
+Este ZIP contiene la estructura inicial del proyecto.
