@@ -2,8 +2,13 @@
    COLA LAVADERO
    SCRIPT.JS
 ============================================================ */
-
-const STORAGE_KEY = "cola_lavadero";
+import {
+    dbAddCar,
+    dbUpdateCar,
+    dbDeleteCar,
+    dbListen,
+    dbGetCars
+} from "./db.js";
 
 let queue = [];
 let editingId = null;
@@ -49,11 +54,6 @@ const els = {
     UTILIDADES
 ============================================================ */
 
-function uid() {
-
-    return crypto.randomUUID();
-
-}
 
 function pad(num) {
 
@@ -97,38 +97,50 @@ function now() {
     LOCAL STORAGE
 ============================================================ */
 
-function saveQueue() {
+async function loadQueueFromFirestore() {
 
-    localStorage.setItem(
-
-        STORAGE_KEY,
-
-        JSON.stringify(queue)
-
+    const q = query(
+        collection(db, "cars"),
+        orderBy("position")
     );
 
-}
+    const snapshot = await getDocs(q);
 
-function loadQueue() {
+    queue = [];
 
-    const data = localStorage.getItem(STORAGE_KEY);
+    snapshot.forEach((document) => {
 
-    if (!data) {
+        const car = document.data();
 
-        queue = [];
+        car.id = document.id;
+
+        queue.push(car);
+
+    });
+
+    if (queue.length > 0) {
+
+        nextCarNumber =
+            Math.max(...queue.map(car => car.number || 0)) + 1;
+
+    } else {
+
         nextCarNumber = 1;
-        return;
 
     }
 
-    try {
+}
 
-        queue = JSON.parse(data);
+function listenQueue() {
+
+    dbListen((cars) => {
+
+        queue = cars;
 
         if (queue.length > 0) {
 
             nextCarNumber =
-                Math.max(...queue.map(car => car.number || 0)) + 1;
+                Math.max(...queue.map(c => c.number || 0)) + 1;
 
         } else {
 
@@ -136,28 +148,24 @@ function loadQueue() {
 
         }
 
-    }
+        render();
 
-    catch {
-
-        queue = [];
-        nextCarNumber = 1;
-
-    }
+    });
 
 }
 
 /* ============================================================
     CREAR COCHE
 ============================================================ */
+async function createCar(duration, type, client = "", phone = "") {
 
-function createCar(duration, type, client = "", phone = "") {
+    const cars = await dbGetCars();
 
     const car = {
 
-        id: uid(),
+        number: nextCarNumber,
 
-        number: nextCarNumber++,
+        position: cars.length + 1,
 
         type,
 
@@ -175,57 +183,56 @@ function createCar(duration, type, client = "", phone = "") {
 
     };
 
-    queue.push(car);
+    nextCarNumber++;
 
-    if (queue.length === 1) {
-
-        queue[0].realStart = now().toISOString();
-
-    }
-
-    recalculateQueue();
-
-    saveQueue();
+    await dbAddCar(car);
 
 }
-
 /* ============================================================
     RECALCULAR COLA
 ============================================================ */
 
-function recalculateQueue() {
+async function recalculateQueue() {
 
     if (queue.length === 0) {
-
         return;
-
     }
 
     let current = queue[0].realStart
-
         ? new Date(queue[0].realStart)
-
         : now();
 
     queue[0].realStart = current.toISOString();
 
+    let position = 1;
+
     for (const car of queue) {
+
+        car.position = position++;
 
         car.start = current.toISOString();
 
         current = addMinutes(
-
             current,
-
             car.duration
-
         );
 
         car.end = current.toISOString();
 
     }
 
-    saveQueue();
+    await Promise.all(
+
+        queue.map(car =>
+            dbUpdateCar(car.id, {
+                position: car.position,
+                start: car.start,
+                end: car.end,
+                realStart: car.realStart
+            })
+        )
+
+    );
 
 }
 
@@ -346,8 +353,7 @@ function editCar(id) {
 /* ============================================================
     ELIMINAR
 ============================================================ */
-
-function deleteCar(id) {
+async function deleteCar(id) {
 
     if (queue.length === 0) return;
 
@@ -357,55 +363,43 @@ function deleteCar(id) {
 
         "¿Eliminar este coche?",
 
-        () => {
+        async () => {
 
-            queue = queue.filter(
+            await dbDeleteCar(id);
 
-                car => car.id !== id
+            // Esperamos a que onSnapshot actualice queue
+            setTimeout(async () => {
 
-            );
+                await recalculateQueue();
 
-            recalculateQueue();
-
-            render();
+            }, 100);
 
         }
 
     );
 
 }
-
 /* ============================================================
     MOVER ARRIBA
 ============================================================ */
 
-function moveCarUp(id) {
+async function moveCarUp(id) {
 
     const index = queue.findIndex(
-
         car => car.id === id
-
     );
 
     if (index <= 1) return;
 
     [
-
         queue[index - 1],
-
         queue[index]
-
     ] = [
-
         queue[index],
-
         queue[index - 1]
-
     ];
 
-    recalculateQueue();
-
-    render();
+    await recalculateQueue();
 
 }
 
@@ -413,12 +407,10 @@ function moveCarUp(id) {
     MOVER ABAJO
 ============================================================ */
 
-function moveCarDown(id) {
+async function moveCarDown(id) {
 
     const index = queue.findIndex(
-
         car => car.id === id
-
     );
 
     if (index === -1) return;
@@ -426,22 +418,14 @@ function moveCarDown(id) {
     if (index === queue.length - 1) return;
 
     [
-
         queue[index],
-
         queue[index + 1]
-
     ] = [
-
         queue[index + 1],
-
         queue[index]
-
     ];
 
-    recalculateQueue();
-
-    render();
+    await recalculateQueue();
 
 }
 
@@ -449,23 +433,30 @@ function moveCarDown(id) {
     FINALIZAR COCHE
 ============================================================ */
 
-function finishCurrentCar() {
+async function finishCurrentCar() {
 
     if (queue.length === 0) return;
 
     const finishTime = now();
 
-    queue.shift();
+    const finishedCar = queue[0];
 
-    if (queue.length > 0) {
+    await dbDeleteCar(finishedCar.id);
 
-        queue[0].realStart = finishTime.toISOString();
+    if (queue.length > 1) {
+
+        await dbUpdateCar(queue[1].id, {
+            realStart: finishTime.toISOString()
+        });
 
     }
 
-    recalculateQueue();
+    // Esperamos a que onSnapshot actualice la cola
+    setTimeout(async () => {
 
-    render();
+        await recalculateQueue();
+
+    }, 100);
 
 }
 
@@ -473,19 +464,19 @@ function finishCurrentCar() {
     REINICIAR JORNADA
 ============================================================ */
 
-function resetDay() {
+async function resetDay() {
 
     showConfirm(
 
         "¿Reiniciar la jornada?",
 
-        () => {
+        async () => {
 
-            queue = [];
+            const deletes = queue.map(car =>
+                dbDeleteCar(car.id)
+            );
 
-            saveQueue();
-
-            render();
+            await Promise.all(deletes);
 
         }
 
@@ -883,101 +874,67 @@ function render() {
     GUARDAR FORMULARIO
 ============================================================ */
 
-function saveForm(e) {
+async function saveForm(e) {
 
     e.preventDefault();
 
     let duration;
-
     let type;
 
     if (els.type.value === "custom") {
 
-        duration = parseInt(
-
-            els.customMinutes.value
-
-        );
+        duration = parseInt(els.customMinutes.value);
 
         if (!duration || duration < 1) {
 
             alert("Introduce una duración válida.");
-
             return;
 
         }
 
         type = "Personalizado";
 
-    }
+    } else {
 
-    else {
-
-        duration = parseInt(
-
-            els.type.value
-
-        );
+        duration = parseInt(els.type.value);
 
         type = duration === 25
-
             ? "Interior / Exterior"
-
             : "Completo";
 
     }
 
-    const client =
-
-        els.clientName.value.trim();
-
-    const phone =
-
-        els.clientPhone.value.trim();
+    const client = els.clientName.value.trim();
+    const phone = els.clientPhone.value.trim();
 
     if (editingId) {
 
-        const car = queue.find(
-
-            c => c.id === editingId
-
-        );
-
-        if (car) {
-
-            car.duration = duration;
-
-            car.type = type;
-
-            car.client = client;
-
-            car.phone = phone;
-
-        }
-
-        recalculateQueue();
-
-    }
-
-    else {
-
-        createCar(
-
+        await dbUpdateCar(editingId, {
             duration,
-
             type,
-
             client,
-
             phone
+        });
 
+        // Esperamos a que onSnapshot actualice queue
+        setTimeout(async () => {
+
+            await recalculateQueue();
+
+        }, 100);
+
+    } else {
+
+        await createCar(
+            duration,
+            type,
+            client,
+            phone
         );
 
     }
 
     closeModal();
-
-    render();
 
 }
 
@@ -1023,9 +980,9 @@ function handleTypeChange() {
     CARGA INICIAL
 ============================================================ */
 
-function initializeQueue() {
+async function initializeQueue() {
 
-    loadQueue();
+    await loadQueueFromFirestore();
 
     if (queue.length > 0) {
 
@@ -1047,33 +1004,23 @@ function initializeQueue() {
 
 function bindEvents() {
 
-    $("add25").addEventListener("click", () => {
+$("add25").addEventListener("click", async () => {
 
-        createCar(
+    await createCar(
+        25,
+        "Interior / Exterior"
+    );
 
-            25,
+});
 
-            "Interior / Exterior"
+$("add45").addEventListener("click", async () => {
 
-        );
+    await createCar(
+        45,
+        "Completo"
+    );
 
-        render();
-
-    });
-
-    $("add45").addEventListener("click", () => {
-
-        createCar(
-
-            45,
-
-            "Completo"
-
-        );
-
-        render();
-
-    });
+});
 
     $("addCustom").addEventListener("click", () => {
 
@@ -1139,13 +1086,11 @@ function bindEvents() {
     INICIO
 ============================================================ */
 
-function init() {
-
-    initializeQueue();
+async function init() {
 
     bindEvents();
 
-    render();
+    listenQueue();
 
     setInterval(
 
@@ -1164,3 +1109,9 @@ document.addEventListener(
     init
 
 );
+
+window.finishCurrentCar = finishCurrentCar;
+window.deleteCar = deleteCar;
+window.editCar = editCar;
+window.moveCarUp = moveCarUp;
+window.moveCarDown = moveCarDown;
